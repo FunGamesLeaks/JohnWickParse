@@ -4,6 +4,7 @@ use std::rc::Rc;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::path::Path;
 use crate::assets::*;
+use crate::dispatch::FNameMap;
 pub mod gltf;
 use gltf::*;
 
@@ -375,7 +376,8 @@ fn setup_skeleton(mesh_data: &mut GLTFItem, skeleton: &FReferenceSkeleton, root_
 }
 
 fn load_material(mesh_data: &mut GLTFItem, material_name: &str) -> ParserResult<GLTFMaterial> {
-    let material_package = Package::from_file(&("materials/".to_owned() + material_name))?;
+    let name_map = FNameMap::empty();
+    let material_package = Package::from_file(&("materials/".to_owned() + material_name), &name_map)?;
     let material_export = material_package.get_export_move(0)?;
     let material_export = match material_export.downcast::<UObject>() {
         Ok(export) => export,
@@ -398,7 +400,10 @@ fn load_material(mesh_data: &mut GLTFItem, material_name: &str) -> ParserResult<
         let texture_name = val_struct.iter().fold(None, |acc, x| {
             if x.get_name() == "ParameterValue" {
                 return match x.get_data() {
-                    FPropertyTagType::ObjectProperty(index) => Some(index.get_import()),
+                    FPropertyTagType::ObjectProperty(index) => Some(match index.get_import() {
+                        Some(data) => data.get_name(),
+                        None => panic!("Import does not exist"),
+                    }),
                     _ => panic!("Not an FPackageIndex"),
                 };
             }

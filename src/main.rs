@@ -1,24 +1,19 @@
-extern crate byteorder;
-extern crate hex;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-#[macro_use]
-extern crate erased_serde;
-extern crate image;
+#![allow(dead_code)]
 
 use std::path::Path;
 use std::fs;
 use std::io::{Read, Write};
 use std::env;
 
+mod dispatch;
 mod decompress;
-mod rijndael;
+mod mapping;
 mod assets;
 mod archives;
 mod texture;
-mod meshes;
-mod anims;
+// mod sound;
+
+use dispatch::{ChunkData, LoaderGlobalData};
 
 #[derive(Debug)]
 struct CommandError {
@@ -58,7 +53,10 @@ fn serialize(params: &[String]) -> CommandResult {
         None => return cerr("No path specified"),
     };
 
-    let package = assets::Package::from_file(path)?;
+    let mut dispatch = dispatch::Extractor::new("paks/global", None)?;
+    let global_data = dispatch.read_global()?;
+
+    let package = assets::Package::from_file(path, &global_data)?;
     let serial_package = serde_json::to_string(&package).unwrap();
     let mut file = fs::File::create(path.to_owned() + ".json").unwrap();
     file.write_all(serial_package.as_bytes()).unwrap();
@@ -72,7 +70,8 @@ fn debug(params: &[String]) -> CommandResult {
         None => return cerr("No path specified"),
     };
 
-    let package = assets::Package::from_file(path)?;
+    let name_map = LoaderGlobalData::empty();
+    let package = assets::Package::from_file(path, &name_map)?;
     println!("{:#?}", package);
 
     Ok(())
@@ -84,8 +83,11 @@ fn texture(params: &[String]) -> CommandResult {
         None => return cerr("No path specified"),
     };
 
-    let package = assets::Package::from_file(path)?;
-    let package_export = package.get_export_move(0)?;
+    let mut dispatch = dispatch::Extractor::new("paks/global", None)?;
+    let global_data = dispatch.read_global()?;
+
+    let package = assets::Package::from_file(path, &global_data)?;
+    let package_export = package.get_export_move(0)?.into_any();
     let texture = match package_export.downcast::<assets::Texture2D>() {
         Ok(data) => data,
         Err(_) => return cerr("Package not exporting texture"),
@@ -100,71 +102,50 @@ fn texture(params: &[String]) -> CommandResult {
     Ok(())
 }
 
-fn mesh(params: &[String]) -> CommandResult {
+/*fn sound(params: &[String]) -> CommandResult {
     let path = match params.get(0) {
         Some(data) => data,
         None => return cerr("No path specified"),
     };
 
-    let package = assets::Package::from_file(path)?;
-    let mesh = meshes::decode_mesh(package, path)?;
-    let serial_mesh = serde_json::to_string(&mesh.data).unwrap();
-    let mut gltf_file = fs::File::create(path.to_owned() + ".gltf").unwrap();
-    gltf_file.write_all(serial_mesh.as_bytes()).unwrap();
+    let name_map = LoaderGlobalData::empty();
+    let package = assets::Package::from_file(path, &name_map)?;
+    let package_export = package.get_export_move(0)?;
+    let sound = match package_export.downcast::<assets::USoundWave>() {
+        Ok(data) => data,
+        Err(_) => return cerr("Package not exporting sound"),
+    };
 
-    let mut bin_file = fs::File::create(path.to_owned() + ".bin").unwrap();
-    bin_file.write_all(&mesh.buffer).unwrap();
+    let sound_data = sound::decode_sound(*sound)?;
+
+    let save_path = path.clone() + ".ogg";
+    let mut file = fs::File::create(save_path).unwrap();
+    file.write_all(&sound_data).unwrap();
 
     Ok(())
-}
+}*/
 
-fn anim(params: &[String]) -> CommandResult {
+fn dispatch(params: &[String]) -> CommandResult {
     let path = match params.get(0) {
         Some(data) => data,
         None => return cerr("No path specified"),
     };
-
-    let package = assets::Package::from_file(path)?;
-    let anim = anims::decode_anim(package, path)?;
-    let serial_anim = serde_json::to_string(&anim.data).unwrap();
-    let mut gltf_file = fs::File::create(path.to_owned() + ".gltf").unwrap();
-    gltf_file.write_all(serial_anim.as_bytes()).unwrap();
-
-    let mut bin_file = fs::File::create(path.to_owned() + ".bin").unwrap();
-    bin_file.write_all(&anim.buffer).unwrap();
-
-    Ok(())
-}
-
-fn add_anim(params: &[String]) -> CommandResult {
-    let path1 = match params.get(0) {
+    let key = match std::fs::read_to_string("key.txt") {
+        Ok(data) => data,
+        Err(_) => return cerr("Could not read key"),
+    };
+    let pattern = match params.get(1) {
         Some(data) => data,
-        None => return cerr("No path specified"),
+        None => return cerr("No pattern specified"),
     };
 
-    let path2 = match params.get(1) {
-        Some(data) => data,
-        None => return cerr("No path specified"),
-    };
+    let mut dispatch = dispatch::Extractor::new(&path, Some(&key))?;
+    let data = dispatch.get_file(pattern)?;
 
-    let package1 = assets::Package::from_file(path1)?.get_export_move(0)?;
-    let package2 = assets::Package::from_file(path2)?.get_export_move(0)?;
-    let mut anim1 = *package1.downcast::<assets::UAnimSequence>().unwrap();
-    let anim2 = *package2.downcast::<assets::UAnimSequence>().unwrap();
+    let filename = pattern.rsplit("/").next().unwrap();
 
-    anim1.add_tracks(anim2);
-
-    /*let serial_package = serde_json::to_string(&anim1).unwrap();
-    let mut file = fs::File::create(path1.to_owned() + ".merge.json").unwrap();
-    file.write_all(serial_package.as_bytes()).unwrap();*/
-
-    let anim = anims::decode_anim_type(anim1, "merged_anim".to_owned())?;
-    let serial_anim = serde_json::to_string(&anim.data).unwrap();
-    let mut gltf_file = fs::File::create(path1.to_owned() + ".merge.gltf").unwrap();
-    gltf_file.write_all(serial_anim.as_bytes()).unwrap();
-
-    let mut bin_file = fs::File::create(path1.to_owned() + ".merge.bin").unwrap();
-    bin_file.write_all(&anim.buffer).unwrap();
+    let mut file = fs::File::create(filename).unwrap();
+    file.write_all(&data).unwrap();
 
     Ok(())
 }
@@ -186,7 +167,8 @@ fn filelist(params: &[String]) -> CommandResult {
                 if let Ok(filepath) = v {
                     return match filepath.path().extension() {
                         Some(extension) => {
-                            extension.to_str().unwrap() == "pak"
+                            let extension_str = extension.to_str().unwrap();
+                            extension_str == "pak" || extension_str == "utoc"
                         },
                         None => false,
                     };
@@ -200,15 +182,66 @@ fn filelist(params: &[String]) -> CommandResult {
     };
 
     for path in paths {
-        let archive = match archives::PakExtractor::new(&path, &key) {
-            Ok(archive) => archive,
-            Err(_) => continue,
+        let file_list: Vec<String> = match &path[(path.len() - 4)..] {
+            ".pak" => {
+                let archive = match archives::PakExtractor::new(&path, &key) {
+                    Ok(archive) => archive,
+                    Err(_) => continue,
+                };
+                let entries = archive.get_entries();
+                entries.iter().map(|v| v.get_filename().to_owned()).collect()
+            },
+            "utoc" => {
+                let dispatch = dispatch::Extractor::new(&path[..(path.len() - 5)], Some(&key))?;
+                dispatch.get_file_list().iter().map(|v| v.to_owned()).collect()
+            }
+            _ => return cerr("Unrecognised Extension"),
         };
-        let entries = archive.get_entries();
-        let file_list = entries.into_iter().map(|v| v.get_filename()).fold(String::new(), |acc, v| acc + v + "\n");
+        let file_str = file_list.iter().fold(String::new(), |acc, v| acc + v + "\n");
         let mut file = fs::File::create(path.to_owned() + ".txt").unwrap();
-        file.write_all(file_list.as_bytes()).unwrap();
+        file.write_all(file_str.as_bytes()).unwrap();
     }
+
+    Ok(())
+}
+
+fn idlist(params: &[String]) -> CommandResult {
+    let path = match params.get(0) {
+        Some(data) => data,
+        None => return cerr("No path specified"),
+    };
+    let key = match std::fs::read_to_string("key.txt") {
+        Ok(data) => data,
+        Err(_) => return cerr("Could not read key"),
+    };
+    let dispatch = dispatch::Extractor::new(&path[..(path.len() - 5)], Some(&key))?;
+
+    let file_list: Vec<String> = dispatch.get_chunk_ids().iter().map(|v| v.get_id().to_string()).collect();
+    let file_str = file_list.iter().fold(String::new(), |acc, v| acc + v + "\n");
+    let mut file = fs::File::create(path.to_owned() + ".txt").unwrap();
+    file.write_all(file_str.as_bytes()).unwrap();
+
+    Ok(())
+}
+
+fn read_header(params: &[String]) -> CommandResult {
+    let path = match params.get(0) {
+        Some(data) => data,
+        None => return cerr("No path specified"),
+    };
+    let key = match std::fs::read_to_string("key.txt") {
+        Ok(data) => data,
+        Err(_) => return cerr("Could not read key"),
+    };
+
+    let mut dispatch = dispatch::Extractor::new(&path, Some(&key))?;
+
+    let loader_data = match dispatch.read_chunk(0)? {
+        ChunkData::ContainerHeader(data) => data,
+        _ => return cerr("Could not find map"),
+    };
+
+    println!("{:#?}", loader_data);
 
     Ok(())
 }
@@ -256,7 +289,7 @@ fn locale(params: &[String]) -> CommandResult {
     let mut locres_buf = Vec::new();
     locres.read_to_end(&mut locres_buf).unwrap();
 
-    let package = assets::locale::FTextLocalizationResource::from_buffer(locres_buf)?;
+    let package = assets::locale::FTextLocalizationResource::from_buffer(&locres_buf)?;
     let serial_package = serde_json::to_string(&package).unwrap();
     let mut file = fs::File::create(path.to_owned() + ".json").unwrap();
     file.write_all(serial_package.as_bytes()).unwrap();
@@ -279,19 +312,20 @@ fn main() {
     let err = match (*command).as_ref() {
         "serialize" => serialize(params),
         "filelist" => filelist(params),
+        "idlist" => idlist(params),
         "extract" => extract(params),
         "texture" => texture(params),
-        "mesh" => mesh(params),
-        "anim" => anim(params),
-        "add_anim" => add_anim(params),
         "locale" => locale(params),
         "debug" => debug(params),
+        //"sound" => sound(params),
+        "dispatch" => dispatch(params),
+        "read_header" => read_header(params),
         _ => {
             println!("Invalid command");
             Ok(())
         },
     };
     if let Err(error) = err {
-        println!("{}", error);
+        println!("Error: {}", error);
     }
 }

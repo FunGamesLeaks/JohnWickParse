@@ -1,20 +1,23 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
 use std::io::{Read, BufReader, Seek, SeekFrom, Cursor};
+use block_modes::{BlockMode, Ecb, block_padding::ZeroPadding};
+use aes_soft::Aes256;
+use flate2::read::ZlibDecoder;
 use crate::assets::{FGuid, Newable, ReaderCursor, read_string, read_tarray, ParserResult, ParserError};
-use crate::rijndael;
 use crate::decompress::oodle;
 
 const PAK_MAGIC: u32 = 0x5A6F12E1;
 const PAK_SIZE: u32 = 8 + 16 + 20 + 1 + 16 + (32 * 5);
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct FPakInfo {
     encryption_key_guid: FGuid,
     encrypted_index: bool,
     version: u32,
     index_offset: u64,
-    index_size: i64,
+    index_size: u64,
     index_hash: [u8; 20],
     compression_methods: Vec<String>,
 }
@@ -23,6 +26,10 @@ pub struct FPakInfo {
 impl FPakInfo {
     pub fn get_key_guid(&self) -> &FGuid {
         &self.encryption_key_guid
+    }
+
+    pub fn get_index_sizes(&self) -> (u64, u64) {
+        (self.index_offset, self.index_size)
     }
 }
 
@@ -37,7 +44,7 @@ impl Newable for FPakInfo {
         }
         let version = reader.read_u32::<LittleEndian>()?;
         let index_offset = reader.read_u64::<LittleEndian>()?;
-        let index_size = reader.read_i64::<LittleEndian>()?;
+        let index_size = reader.read_u64::<LittleEndian>()?;
 
         let mut index_hash = [0u8; 20];
         reader.read_exact(&mut index_hash)?;
@@ -79,7 +86,10 @@ fn get_index(header: &FPakInfo, reader: &mut BufReader<File>, key: &str) -> Vec<
         return ciphertext;
     }
     let key = hex::decode(key).expect("Hex error");
-    rijndael::rijndael_decrypt_buf(&ciphertext, &key)
+
+    let decrypt = Ecb::<Aes256, ZeroPadding>::new_var(&key, Default::default()).unwrap();
+    decrypt.decrypt(&mut ciphertext).unwrap();
+    ciphertext
 }
 
 #[allow(dead_code)]
@@ -103,14 +113,15 @@ impl Newable for FPakCompressedBlock {
 #[derive(Debug, Clone)]
 pub struct FPakEntry {
     filename: String,
-    position: i64,
-    size: i64,
+    pub position: i64,
+    pub size: u64,
     uncompressed_size: u64,
     compression_method: u32,
     compression_blocks: Vec<FPakCompressedBlock>,
-    encrypted: bool,
+    pub hash: [u8; 20],
+    pub encrypted: bool,
     compression_block_size: u32,
-    struct_size: u64,
+    pub struct_size: u64,
 }
 
 #[allow(dead_code)]
@@ -118,7 +129,7 @@ impl FPakEntry {
     fn new(reader: &mut ReaderCursor, filename: String) -> ParserResult<Self> {
         let seek_point = reader.position();
         let position = reader.read_i64::<LittleEndian>()?;
-        let size = reader.read_i64::<LittleEndian>()?;
+        let size = reader.read_u64::<LittleEndian>()?;
         let uncompressed_size = reader.read_u64::<LittleEndian>()?;
         let compression_method = reader.read_u32::<LittleEndian>()?;
         let mut hash = [0u8; 20];
@@ -127,9 +138,9 @@ impl FPakEntry {
         if compression_method != 0 {
             compression_blocks = read_tarray(reader)?;
         }
-        
+
         Ok(Self {
-            filename, position, size, uncompressed_size, compression_method, compression_blocks,
+            filename, position, size, uncompressed_size, compression_method, compression_blocks, hash,
             encrypted: reader.read_u8()? != 0,
             compression_block_size: reader.read_u32::<LittleEndian>()?,
             struct_size: reader.position() - seek_point,
@@ -140,33 +151,203 @@ impl FPakEntry {
     pub fn get_filename(&self) -> &str {
         &self.filename[..]
     }
+
+    fn from_encoded(reader: &mut ReaderCursor, dir_name: &str, index_data: &FPathHashIndexEntry) -> ParserResult<Self> {
+        reader.seek(SeekFrom::Start(index_data.location as u64))?;
+        let flags = reader.read_u32::<LittleEndian>()?;
+
+        let offset_safe = (flags & (1 << 31)) != 0;
+        let position = match offset_safe {
+            true => reader.read_u32::<LittleEndian>()? as i64,
+            false => reader.read_u64::<LittleEndian>()? as i64,
+        };
+
+        let uncompressed_size_safe = (flags & (1 << 30)) != 0;
+        let uncompressed_size = match uncompressed_size_safe {
+            true => reader.read_u32::<LittleEndian>()? as u64,
+            false => reader.read_u64::<LittleEndian>()?,
+        };
+
+        let mut size = uncompressed_size;
+        let compression_method = (flags >> 23) & 0x3f;
+        if compression_method != 0 {
+            let size_safe = (flags & (1 << 29)) != 0;
+            size = match size_safe {
+                true => reader.read_u32::<LittleEndian>()? as u64,
+                false => reader.read_u64::<LittleEndian>()?,
+            };
+        }
+
+        let encrypted = (flags & (1 << 22)) != 0;
+
+        let compression_block_count = (flags >> 6) & 0xffff;
+        let mut compression_block_size = 0;
+        if compression_block_count > 0 {
+            compression_block_size = match uncompressed_size < 65536 {
+                true => uncompressed_size as u32,
+                false => ((flags & 0x3f) << 11),
+            };
+        }
+
+        let mut struct_size: u64 = 8 + 8 + 8 + 20 + 4 + 4 + 1;
+
+        if compression_method != 0 {
+            struct_size += 4 + (compression_block_count as u64) * 16;
+        }
+
+        let mut compression_blocks = Vec::new();
+        let mut compressed_block_offset = struct_size as i64;
+
+        if compression_block_count == 1 {
+            compression_blocks.push(FPakCompressedBlock {
+                compressed_start: struct_size as i64,
+                compressed_end: (struct_size + size) as i64,
+            });
+        } else {
+            for _i in 0..compression_block_count {
+                let size_data = reader.read_u32::<LittleEndian>()? as i64;
+                compression_blocks.push(FPakCompressedBlock {
+                    compressed_start: compressed_block_offset,
+                    compressed_end: compressed_block_offset + size_data,
+                });
+                compressed_block_offset += size_data;
+            }
+        }
+
+        Ok(Self {
+            filename: dir_name.to_owned() + &index_data.key,
+            position,
+            size,
+            uncompressed_size,
+            compression_method,
+            encrypted,
+            // Not gonna support this straight away
+            compression_blocks,
+            hash: [0u8; 20],
+            compression_block_size,
+            struct_size,
+        })
+    }
 }
 
 #[allow(dead_code)]
-struct FPakIndex {
+pub struct FPakIndex {
     mount_point: String,
     file_count: u32,
     index_entries: Vec<FPakEntry>,
+    encoded_pak: Vec<u8>,
+    path_index: (i64, i64),
+    dir_index: (i64, i64),
 }
 
-impl FPakIndex {
+impl Newable for FPakIndex {
     fn new(reader: &mut ReaderCursor) -> ParserResult<Self> {
         let mount_point = read_string(reader)?;
         if mount_point.len() > 1024 {
             return Err(ParserError::new(format!("Could not read Pak Archive")));
         }
         let file_count = reader.read_u32::<LittleEndian>()?;
+
+        let _hash_seed = reader.read_u64::<LittleEndian>()?;
+        let has_path_index = reader.read_i32::<LittleEndian>()? != 0;
+        let path_index = match has_path_index {
+            true => {
+                let path_index_offset = reader.read_i64::<LittleEndian>()?;
+                let path_index_size = reader.read_i64::<LittleEndian>()?;
+                let mut hash = [0u8; 20];
+                reader.read_exact(&mut hash)?;
+                (path_index_offset, path_index_size)
+            },
+            false => return Err(ParserError::new(format!("No path index present"))),
+        };
+
+        let has_dir_index = reader.read_i32::<LittleEndian>()? != 0;
+        let dir_index = match has_dir_index {
+            true => {
+                let dir_index_offset = reader.read_i64::<LittleEndian>()?;
+                let dir_index_size = reader.read_i64::<LittleEndian>()?;
+                let mut hash = [0u8; 20];
+                reader.read_exact(&mut hash)?;
+                (dir_index_offset, dir_index_size)
+            },
+            false => return Err(ParserError::new(format!("No directory index present"))),
+        };
+
+        let encoded_pak: Vec<u8> = read_tarray(reader)?;
+        let new_file_count = reader.read_u32::<LittleEndian>()?;
+
         let mut index_entries = Vec::new();
-        for _i in 0..file_count {
-            let filename = read_string(reader)?;
-            index_entries.push(FPakEntry::new(reader, filename)?);
+        for _i in 0..new_file_count {
+            index_entries.push(FPakEntry::new(reader, "test".to_owned())?);
         }
-        
+
         Ok(Self {
             mount_point,
             file_count,
             index_entries,
+            encoded_pak,
+            path_index,
+            dir_index,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FPathHashIndexEntry {
+    key: String,
+    location: u32,
+}
+
+impl Newable for FPathHashIndexEntry {
+    fn new(reader: &mut ReaderCursor) -> ParserResult<Self> {
+        Ok(Self {
+            key: read_string(reader)?,
+            location: reader.read_u32::<LittleEndian>()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FPakDirectoryEntry {
+    key: String,
+    value: Vec<FPathHashIndexEntry>,
+}
+
+impl Newable for FPakDirectoryEntry {
+    fn new(reader: &mut ReaderCursor) -> ParserResult<Self> {
+        Ok(Self {
+            key: read_string(reader)?,
+            value: read_tarray(reader)?,
+        })
+    }
+}
+
+impl FPakIndex {
+    pub fn get_entries(&self) -> &[FPakEntry] {
+        self.index_entries.as_slice()
+    }
+
+    pub fn get_mount_point(&self) -> &str {
+        &self.mount_point
+    }
+
+    pub fn get_dir_index(&self) -> (i64, i64) {
+        self.dir_index
+    }
+
+    pub fn update_from_index(&mut self, reader: &mut ReaderCursor) -> ParserResult<()> {
+        let directory_index: Vec<FPakDirectoryEntry> = read_tarray(reader)?;
+        let mut encoded_cursor = Cursor::new(self.encoded_pak.as_slice());
+        let mut pak_entries = Vec::new();
+        for dir_entry in &directory_index {
+            for pak_entry in &dir_entry.value {
+                pak_entries.push(FPakEntry::from_encoded(&mut encoded_cursor, &dir_entry.key, &pak_entry)?);
+            }
+        }
+
+        self.index_entries = pak_entries;
+
+        Ok(())
     }
 }
 
@@ -175,15 +356,23 @@ impl FPakIndex {
 pub struct PakExtractor {
     header: FPakInfo,
     index: FPakIndex,
-    key: String,
+    key: Vec<u8>,
     reader: BufReader<File>,
 }
 
 fn decompress_block(input: &[u8], output_size: u64, compression_method: &str) -> Vec<u8> {
     match compression_method {
         "Oodle" => oodle::decompress_stream(output_size, input).unwrap(),
+        "Zlib" => decompress_zlib(output_size, input),
         _ => Vec::new(),
     }
+}
+
+fn decompress_zlib(output_size: u64, input: &[u8]) -> Vec<u8> {
+    let mut data = vec![0u8; output_size as usize];
+    let mut z = ZlibDecoder::new(input);
+    z.read_exact(&mut data).unwrap();
+    data
 }
 
 #[allow(dead_code)]
@@ -196,17 +385,29 @@ impl PakExtractor {
         let mut header_b = vec![0u8; PAK_SIZE as usize];
         reader.read_exact(&mut header_b)?;
 
-        let mut header_reader = Cursor::new(header_b);
+        let mut header_reader = Cursor::new(header_b.as_slice());
         let header = FPakInfo::new(&mut header_reader)?;
 
         let index_data = get_index(&header, &mut reader, key);
-        let mut index_reader = Cursor::new(index_data);
-        let index = FPakIndex::new(&mut index_reader)?;
+        let mut index_reader = Cursor::new(index_data.as_slice());
+        let mut index = FPakIndex::new(&mut index_reader)?;
+
+        // read directory index
+        reader.seek(SeekFrom::Start(index.dir_index.0 as u64))?;
+        let mut dir_index_b = vec![0u8; index.dir_index.1 as usize];
+        reader.read_exact(&mut dir_index_b)?;
+
+        let key = hex::decode(key).expect("Hex error");
+        let decrypt = Ecb::<Aes256, ZeroPadding>::new_var(&key, Default::default()).unwrap();
+        decrypt.decrypt(&mut dir_index_b).unwrap();
+        let mut directory_reader = Cursor::new(dir_index_b.as_slice());
+
+        index.update_from_index(&mut directory_reader)?;
 
         Ok(Self {
             header,
             index,
-            key: key.to_owned(),
+            key,
             reader,
         })
     }
@@ -218,7 +419,7 @@ impl PakExtractor {
         let mut header_b = vec![0u8; PAK_SIZE as usize];
         reader.read_exact(&mut header_b)?;
 
-        let mut header_reader = Cursor::new(header_b);
+        let mut header_reader = Cursor::new(header_b.as_slice());
         let header = FPakInfo::new(&mut header_reader)?;
 
         Ok(header)
@@ -230,7 +431,7 @@ impl PakExtractor {
     }
 
     /// Uses an `FPakEntry` to seek to and extract a file from a `.pak` file
-    /// 
+    ///
     /// Note that the `FPakEntry` must come from the same `PakExtractor`, using a mismatched one will panic
     pub fn get_file(&mut self, file: &FPakEntry) -> Vec<u8> {
         let start_pos = file.position as u64 + file.struct_size;
@@ -245,10 +446,11 @@ impl PakExtractor {
             };
             let mut enc_buffer = vec![0u8; enc_size as usize];
             self.reader.read_exact(&mut enc_buffer).unwrap();
-            let key = hex::decode(&self.key).expect("Hex error");
-            let plain_buffer = rijndael::rijndael_decrypt_buf(&enc_buffer, &key);
-            let mut plain_cursor = Cursor::new(plain_buffer);
-            plain_cursor.read_exact(&mut buffer).unwrap();
+
+            let decrypt = Ecb::<Aes256, ZeroPadding>::new_var(&self.key, Default::default()).unwrap();
+            decrypt.decrypt(&mut enc_buffer).unwrap();
+
+            buffer.copy_from_slice(&enc_buffer[..file.size as usize]);
         } else {
             self.reader.read_exact(&mut buffer).unwrap();
         }

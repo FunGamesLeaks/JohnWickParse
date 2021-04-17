@@ -54,7 +54,7 @@ pub struct FTextLocalizationResource {
 }
 
 impl FTextLocalizationResource {
-    pub fn from_buffer(locres: Vec<u8>) -> ParserResult<Self> {
+    pub fn from_buffer(locres: &[u8]) -> ParserResult<Self> {
         let mut reader = ReaderCursor::new(locres);
         let magic = FGuid::new(&mut reader)?;
 
@@ -88,7 +88,7 @@ impl FTextLocalizationResource {
                 let text_key = FTextKey::new(&mut reader)?;
                 let _source_hash = reader.read_u32::<LittleEndian>()?;
                 let string_index = reader.read_i32::<LittleEndian>()?;
-                if string_index > 0 && string_index < localized_strings.len() as i32 {
+                if string_index >= 0 && string_index < localized_strings.len() as i32 {
                     strings.push(FEntry {
                         key: text_key.text,
                         data: localized_strings[string_index as usize].data.clone(),
